@@ -1,0 +1,693 @@
+================================================================================
+ FINAL VOICE AGENT - DEPLOYMENT & OPERATIONS GUIDE
+ Urdu Restaurant Voice Agent (STT -> Hybrid RAG -> LLM -> TTS)
+ Last updated: 2026-07-05
+================================================================================
+
+WHAT THIS IS
+------------
+One FastAPI process that runs the complete voice agent:
+  mic audio -> Deepgram STT (live, Urdu) -> BGE-M3 embedding (local) ->
+  Hybrid retrieval (Qdrant vector + BM25 keyword) -> Groq LLM
+  (llama-3.3-70b, OpenAI gpt-4o-mini auto-fallback) -> UpliftAI TTS -> audio out
+
+Includes per-call conversation memory (multi-turn, order taking), a hard
+5-sentence reply cap, warm-connection keepalive, retry/fallback handling,
+barge-in (talk over the agent to interrupt), mic noise reduction, and the
+browser test website served at /ui (it is part of the service —
+routers/ui.py — no separate web server needed). See section 11 for the
+2026-07-03/04 changes and section 12 for the 2026-07-05 changes
+(barge-in, noise reduction, order-complete flow, mixed Urdu/English,
+number-garble handling, English digit read-back).
+
+The n8n workflow from earlier phases is a SEPARATE system and is NOT needed
+to run this service.
+
+
+================================================================================
+ 1. FOLDER CONTENTS (what every file is for)
+================================================================================
+
+Final Voice Agent\
+|
+|-- DEPLOYMENT_GUIDE.txt        <- this file
+|-- start_windows.bat           <- one-click start on Windows (after setup)
+|-- start_linux.sh              <- one-command start on Linux (after setup)
+|
+|-- voice_inference_service\    <- THE ENTIRE SERVICE (all code)
+|   |-- app.py                  <- FastAPI entrypoint (run this)
+|   |-- config.py               <- every setting + env var default
+|   |-- keys.env                <- YOUR REAL API KEYS + provider config
+|   |                              (KEEP PRIVATE - do not share this folder
+|   |                               publicly without deleting this file)
+|   |-- prompts.py              <- the receptionist persona / system prompt
+|   |-- startup.py              <- loads models once, warm-connection task
+|   |-- state.py                <- shared app state (incl. conversation memory)
+|   |-- dependencies.py         <- service wiring
+|   |-- requirements.txt        <- packages to install (use this one)
+|   |-- routers\
+|   |   |-- ui.py               <- THE TEST WEBSITE (served at /ui)
+|   |   |-- voice_stream.py     <- WS /ws/voice: the live voice pipeline
+|   |   |-- voice.py            <- POST /voice: single-request pipeline
+|   |   |-- stt.py, tts.py, llm.py, embeddings.py, retrieval.py, health.py
+|   |-- services\
+|   |   |-- stt_service.py          <- Deepgram/ElevenLabs sessions
+|   |   |-- embedding_service.py    <- OpenAI / local BGE-M3 embeddings
+|   |   |-- hybrid_retrieval_service.py  <- vector + BM25 + merge + corrective
+|   |   |-- qdrant_service.py       <- vector DB client
+|   |   |-- bm25_service.py         <- in-process keyword index
+|   |   |-- llm_service.py          <- Groq + OpenAI fallback + history
+|   |   |-- tts_service.py          <- UpliftAI TTS + Urdu text sanitizer
+|   |   |-- conversation_service.py <- per-call LLM memory store
+|   |   |-- corrective_rag_service.py, agentic_service.py, ...
+|   |-- *.bak_* files           <- rollback copies of every file I changed
+|   |                              (safe to delete once you're happy)
+|   |-- pipeline_benchmark*.py, compare_*.py, demo_*.py  <- benchmark tools
+|
+|-- restaurant_data\            <- THE KNOWLEDGE BASE (menu/FAQ .txt files)
+|                                  BM25 indexes this at every startup.
+|                                  Edit these files to change the menu.
+|
+|-- qdrant_export_bgem3.json    <- the vector DB data (154 chunks, already
+|                                  embedded with BGE-M3) - restores in
+|                                  seconds on any machine, NO re-embedding
+|-- restore_qdrant.py           <- restores the above into Qdrant
+|-- reembed_bgem3.py            <- FULL rebuild of embeddings from
+|                                  restaurant_data (only needed after you
+|                                  EDIT the menu files; downloads BGE-M3)
+|-- requirements_frozen.txt     <- exact package versions from the working
+|                                  server (Linux reference; on Windows use
+|                                  requirements.txt instead)
+|
+|-- tests\                      <- verification scripts (run on the machine
+    |                              where the service is running)
+    |-- test_conversation.py    <- 4-turn memory + order-taking test
+    |-- test_ws_memory.py       <- memory across separate connections
+    |-- test_spec.py            <- latency profile per turn
+    |-- test_live_ws.py         <- full voice loop (needs ffmpeg)
+    |-- verify_prompt.py        <- prompt accuracy checks
+
+
+================================================================================
+ 2. ALL PORTS - WHAT, WHERE, WHY
+================================================================================
+
+LOCAL PORTS (on the machine running the service):
+
+  PORT   WHAT                        USED BY / NOTES
+  -----  --------------------------  -------------------------------------------
+  8800   Voice agent service + the   EVERYTHING lives here:
+         test website                  /ui           <- test website (browser)
+                                       /ws/voice     <- live voice WebSocket
+                                       /voice        <- single-shot voice POST
+                                       /stt /tts /llm /embed /retrieve
+                                       /health       <- readiness + providers
+                                       /benchmark/stats
+                                     Change with VIS_PORT in keys.env.
+  6333   Qdrant vector DB (HTTP)     The service queries it on localhost only.
+                                     Change with VIS_QDRANT_PORT.
+  6334   Qdrant gRPC                 Opened by Qdrant automatically; this
+                                     service does NOT use it. Ignore.
+
+OPTIONAL / LEGACY LOCAL PORTS (NOT needed for this package):
+
+  8000   ChromaDB                    Old vector DB. Replaced by Qdrant
+                                     (VIS_VECTOR_DB_PROVIDER=qdrant). Unused.
+  11434  Ollama                      Only if you ever set VIS_LLM_PROVIDER=local.
+  5678   n8n production workflow     Separate system, not part of this package.
+  5690   n8n Deepgram variant        Separate system, not part of this package.
+
+EXTERNAL CLOUD APIs (outbound HTTPS/WSS - no local ports, no firewall
+inbound rules needed; the server just needs internet access):
+
+  api.deepgram.com        Live STT (Urdu, nova-3)     - WSS during speech
+  api.elevenlabs.io       Blob-mode STT (scribe)      - HTTPS per request
+  api.groq.com            LLM (llama-3.3-70b)         - HTTPS, streamed
+  api.openai.com          LLM fallback (gpt-4o-mini)  - HTTPS, streamed
+  api.upliftai.org        Urdu TTS                    - HTTPS per sentence
+  api.cohere.ai           Reranker key present; reranking is currently
+                          DISABLED in the pipeline (merged results are used
+                          directly), so no traffic goes here.
+
+REMOTE ACCESS PORTS (only when running on a rented server, e.g. vast.ai):
+
+  SSH port (vast gives you a random one, e.g. 11163) - shell access +
+  SSH tunneling. The current instance is: ssh -p 11163 root@ssh3.vast.ai
+
+IMPORTANT - MICROPHONE + BROWSER SECURITY:
+  Browsers only allow microphone access on https:// pages or on
+  http://localhost. So to use /ui on a REMOTE server you must either:
+    a) cloudflared tunnel (gives you an https:// URL) - see section 5, or
+    b) SSH local port forward and browse http://localhost:8080 - section 5.
+  Browsing http://<server-ip>:8800/ui directly will load the page but the
+  mic button will NOT work (no secure context).
+
+
+================================================================================
+ 3. DEPLOY ON A NEW SERVER (Linux, e.g. a fresh vast.ai instance)
+================================================================================
+
+Copy the whole "Final Voice Agent" folder to the server first, e.g.:
+  scp -P <SSH_PORT> -r "Final Voice Agent" root@<HOST>:/workspace/
+
+STEP 1 - Python environment
+  cd "/workspace/Final Voice Agent"
+  python3 -m venv venv
+  ./venv/bin/pip install -r voice_inference_service/requirements.txt
+  (requirements_frozen.txt lists the exact known-good versions if you ever
+   need to pin something.)
+
+STEP 2 - Qdrant (vector database) on port 6333
+  Easiest (docker):
+    docker run -d --name qdrant -p 6333:6333 \
+      -v /workspace/qdrant_storage:/qdrant/storage qdrant/qdrant
+  No docker (vast.ai containers can't run docker) - use the binary:
+    cd /workspace
+    wget https://github.com/qdrant/qdrant/releases/latest/download/qdrant-x86_64-unknown-linux-gnu.tar.gz
+    tar xzf qdrant-x86_64-unknown-linux-gnu.tar.gz
+    tmux new-session -d -s qdrant "cd /workspace && ./qdrant"
+
+STEP 3 - Restore the vector data (seconds, no re-embedding)
+  cd "/workspace/Final Voice Agent"
+  ./venv/bin/python restore_qdrant.py
+  -> "Restored collection 'restaurant_knowledge_bgem3': 154 points"
+
+STEP 4 - Start the service (keep it alive in tmux)
+  chmod +x start_linux.sh
+  tmux new-session -d -s vis "./start_linux.sh >> /tmp/vis.log 2>&1"
+
+  FIRST START ONLY: the service downloads the BGE-M3 embedding model
+  (~2.3 GB) from HuggingFace. This can take several minutes. Watch it:
+    tail -f /tmp/vis.log
+  The service is up when:  curl http://localhost:8800/health
+  returns "ready": true.
+
+STEP 5 - Expose the website (pick ONE - see section 5 for details)
+  cloudflared (public https URL, works anywhere):
+    tmux new-session -d -s cftunnel \
+      "cloudflared tunnel --url http://localhost:8800 --no-autoupdate 2>&1 | tee /tmp/cf.log"
+    grep -o 'https://[a-z-]*\.trycloudflare\.com' /tmp/cf.log
+  or SSH tunnel (private, only you):
+    (from your PC)  ssh -p <SSH_PORT> root@<HOST> -L 8080:localhost:8800
+    then browse     http://localhost:8080/ui
+
+STEP 6 - Verify
+  curl http://localhost:8800/health          <- "ready": true, providers listed
+  cd "/workspace/Final Voice Agent"
+  ./venv/bin/python tests/test_conversation.py   <- memory + ordering PASS
+  Then open /ui in the browser and talk to it.
+
+
+================================================================================
+ 4. RUN ON YOUR PC (Windows)
+================================================================================
+
+STEP 1 - Python (once)
+  Install Python 3.10, 3.11 or 3.12 from python.org
+  ("Add python.exe to PATH" checked).
+
+STEP 2 - Packages (once)
+  Open PowerShell in the "Final Voice Agent" folder:
+    python -m venv venv
+    .\venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cpu
+    .\venv\Scripts\pip install -r voice_inference_service\requirements.txt
+  (The first line grabs the small CPU-only torch; skipping it makes pip
+   download a multi-GB CUDA build you don't need on a laptop.)
+
+STEP 3 - Qdrant (once, pick one)
+  a) Docker Desktop:
+     docker run -d --name qdrant -p 6333:6333 -v %CD%\qdrant_storage:/qdrant/storage qdrant/qdrant
+  b) No Docker - native Windows binary:
+     Download qdrant-x86_64-pc-windows-msvc.zip from
+     https://github.com/qdrant/qdrant/releases , unzip anywhere,
+     double-click qdrant.exe (leave its window open).
+
+STEP 4 - Restore the vector data (once)
+    .\venv\Scripts\python restore_qdrant.py
+    -> "Restored collection 'restaurant_knowledge_bgem3': 154 points"
+
+STEP 5 - Start the agent
+    Double-click start_windows.bat
+  FIRST START ONLY: downloads the BGE-M3 model (~2.3 GB). Wait until the
+  console shows the app is ready (or check http://localhost:8800/health).
+
+STEP 6 - Use it
+    Open http://localhost:8800/ui in Chrome/Edge and talk.
+    (localhost counts as a secure context, so the mic works directly -
+     no tunnel needed on your own PC.)
+
+EVERY LATER START on the PC: make sure qdrant.exe (or the docker
+container) is running, then double-click start_windows.bat. That's it.
+
+
+================================================================================
+ 5. EXPOSING THE WEBSITE FROM A REMOTE SERVER
+================================================================================
+
+Option A - cloudflared quick tunnel (PUBLIC https URL)
+  + Works from any device, anywhere; mic works (https).
+  - URL is UNAUTHENTICATED (anyone with the link can use the agent and
+    spend your API credits) and CHANGES every time the tunnel restarts.
+  Install once:  (vast.ai images usually ship it at
+                  /opt/instance-tools/bin/cloudflared; otherwise
+                  download from github.com/cloudflare/cloudflared/releases)
+  Run:
+    cloudflared tunnel --url http://localhost:8800 --no-autoupdate
+  The https://xxxx.trycloudflare.com URL it prints is your website
+  (append /ui). Keep it in tmux so it survives your SSH logout.
+
+Option B - SSH local port forward (PRIVATE, only your PC)
+  + Nothing exposed publicly, no token, mic works (localhost).
+  - Only works while your SSH session is open, only on your PC.
+  From your PC:
+    ssh -p <SSH_PORT> root@<HOST> -L 8080:localhost:8800
+  Then browse:  http://localhost:8080/ui
+  (8080 is just the local end of the tunnel - any free port works.)
+
+Option C - vast.ai Caddy portal (token-authenticated public URL)
+  vast.ai instances front apps with Caddy + a token. See the instance's
+  /etc/vast-agents-guide.md ("Expose your own app"). More setup, but the
+  URL is protected by your instance token.
+
+
+================================================================================
+ 6. keys.env - EVERY VARIABLE EXPLAINED
+================================================================================
+
+The file voice_inference_service\keys.env is loaded by both start scripts.
+Current contents (values omitted here - they are in the file):
+
+  VIS_OPENAI_API_KEY      OpenAI - LLM fallback (gpt-4o-mini)
+  VIS_ELEVENLABS_API_KEY  ElevenLabs - blob-mode STT
+  VIS_DEEPGRAM_API_KEY    Deepgram - live STT (the mode /ui uses)
+  VIS_UPLIFTAI_API_KEY    UpliftAI - Urdu TTS
+  VIS_COHERE_API_KEY      Cohere - reranker (currently unused by pipeline)
+  VIS_GROQ_API_KEY        Groq - primary LLM (llama-3.3-70b-versatile)
+
+  VIS_VECTOR_DB_PROVIDER=qdrant        use Qdrant (not Chroma)
+  VIS_LLM_PROVIDER=groq                Groq primary, auto-falls back to OpenAI
+  VIS_LLM_MAX_TOKENS=200               generation cap (replies are also
+                                       hard-capped at 5 sentences in code)
+  VIS_EMBEDDING_PROVIDER=bge_m3_local  local BGE-M3 (strong Urdu support)
+  VIS_QDRANT_COLLECTION=restaurant_knowledge_bgem3   the BGE-M3 collection
+  VIS_RETRIEVAL_TOP_K=3                chunks of context per question
+  VIS_LIVE_STT_PROVIDER=deepgram       live /ui STT = Deepgram Nova-3 (pinned)
+  VIS_DEVICE=cpu                       CPU (P4000 unsupported by base torch —
+                                       see the GPU note in section 10)
+  VIS_DASHBOARD_INGEST_URL=<tunnel>    cloudflared URL of the PC dashboard's
+                                       :4000 backend (calls/orders are POSTed
+                                       here). trycloudflare URLs change on
+                                       every restart — update this each time.
+
+Other useful overrides you can add (defaults are in config.py):
+  VIS_PORT=8800                 service port
+  VIS_QDRANT_HOST=localhost     where Qdrant runs
+  VIS_QDRANT_PORT=6333
+  VIS_BM25_DATA_DIR=<path>      where the menu .txt files live (the start
+                                scripts set this to the packaged
+                                restaurant_data folder automatically)
+  VIS_LIVE_STT_PROVIDER=deepgram   (or elevenlabs)
+  VIS_GROQ_LLM_MODEL=llama-3.3-70b-versatile
+
+ROLLBACKS (one line + restart):
+  Back to OpenAI LLM:        VIS_LLM_PROVIDER=openai
+  Back to OpenAI embeddings: VIS_EMBEDDING_PROVIDER=openai and
+                             VIS_QDRANT_COLLECTION=restaurant_knowledge
+                             (only works if the old 1536-dim collection
+                              exists on that machine)
+
+SECURITY: keys.env contains REAL API keys. Anyone with this folder can
+spend your credits. Don't upload it anywhere public; rotate keys at each
+provider's dashboard if you ever suspect a leak.
+
+
+================================================================================
+ 7. UPDATING THE MENU / KNOWLEDGE BASE
+================================================================================
+
+1. Edit the .txt files in restaurant_data\ (one topic per blank-line-
+   separated paragraph: item + price + description, or one FAQ Q&A).
+2. Rebuild the embeddings (downloads BGE-M3 if not cached):
+     ./venv/bin/python reembed_bgem3.py        (Linux)
+     .\venv\Scripts\python reembed_bgem3.py    (Windows)
+3. Restart the service (BM25 reindexes restaurant_data automatically at
+   every startup; the reembed script refreshes the Qdrant vectors).
+4. Optional: re-export for portability so this package stays current:
+   the export script pattern is in this guide's history - or just carry
+   restaurant_data + reembed_bgem3.py and rebuild on each machine.
+
+
+================================================================================
+ 8. SWITCHING SERVERS - QUICK CHECKLIST
+================================================================================
+
+On the NEW server:
+  [ ] scp the "Final Voice Agent" folder over
+  [ ] python3 -m venv venv && pip install -r voice_inference_service/requirements.txt
+  [ ] start Qdrant (docker or binary, port 6333)
+  [ ] python restore_qdrant.py            (154 points, seconds)
+  [ ] tmux new -d -s vis "./start_linux.sh >> /tmp/vis.log 2>&1"
+  [ ] wait for /health "ready": true      (first start: BGE-M3 download)
+  [ ] start cloudflared tunnel OR use SSH -L port forward
+  [ ] open <url>/ui and do one test call
+
+Nothing else is needed - API keys travel in keys.env, the menu travels in
+restaurant_data, the vector data travels in qdrant_export_bgem3.json, and
+conversation memory is in-process (starts empty on every machine - that
+is by design, it is per-call memory).
+
+
+================================================================================
+ 9. VERIFYING A DEPLOYMENT (tests)
+================================================================================
+
+All tests run ON the machine where the service is running, from inside
+the voice_inference_service folder, with keys.env loaded:
+
+  Linux:
+    cd "Final Voice Agent/voice_inference_service"
+    set -a; . ./keys.env; set +a
+    ../venv/bin/python ../tests/test_conversation.py
+  Windows (PowerShell):
+    cd "Final Voice Agent\voice_inference_service"
+    Get-Content keys.env | ForEach-Object { if ($_ -match '^([A-Z_]+)=(.*)$') { Set-Item "env:$($Matches[1])" $Matches[2] } }
+    ..\venv\Scripts\python ..\tests\test_conversation.py
+
+  test_conversation.py  - 4-turn Urdu conversation: memory, multi-detail
+                          single-line capture, order-complete auto-close
+                          (no re-confirm), post-close correction (expect PASS)
+  test_barge_in.py      - barge-in: normal turn completes; an interrupt mid-
+                          reply cancels generation fast (needs ffmpeg)
+  test_number_normalizer.py - unit tests for spoken-number -> digits, incl.
+                          the exact Deepgram garbles seen in live calls
+  test_number_audio.py  - REAL audio: TTS a phone number -> Deepgram ur ->
+                          normalizer must recover the digits (needs ffmpeg)
+  test_digits_tts.py    - TTS speaks 7+ digit numbers as English digit words
+                          ("zero, three, one, ...") (needs ffmpeg)
+  test_ws_memory.py     - memory across separate WebSocket connections
+                          (needs the service running + ffmpeg installed)
+  test_spec.py          - per-turn latency profile (needs service + ffmpeg)
+  test_live_ws.py       - full voice loop incl. script-purity checks
+                          (needs service + ffmpeg)
+  verify_prompt.py      - prompt accuracy (price / fallback / identity)
+
+Quick manual checks:
+  curl http://localhost:8800/health           -> "ready": true
+  curl http://localhost:8800/benchmark/stats  -> rolling latency stats
+
+
+================================================================================
+ 10. NOTES, GOTCHAS & CURRENT LIVE DEPLOYMENT
+================================================================================
+
+- FIRST START on any machine downloads BAAI/bge-m3 (~2.3 GB) from
+  HuggingFace into the HF cache. Every later start loads from cache
+  (~20-60s on CPU). The service reports "ready": false until loaded.
+
+- The service keeps cloud connections WARM (background pings to Groq,
+  OpenAI, UpliftAI every 15s) - this is why TTS answers in ~0.4s instead
+  of ~1.4s. It starts automatically; nothing to configure.
+
+- Conversation memory: one conversation per browser page load (the page
+  generates a conversation_id). Reload the page = fresh conversation.
+  Memory lives in the service process: restart = all conversations reset.
+  30 minutes of inactivity also ends a conversation.
+
+- Replies are hard-capped at 5 complete sentences in code
+  (voice_stream.py: _MAX_REPLY_SENTENCES; raised 4->5 on 07-05 so the
+  order-complete read-back + closing line fit in one reply). One sentence
+  may still appear as two "tts sentence" chunks in the UI - that is
+  comma-splitting for faster audio start, not an extra sentence.
+
+- Barge-in (07-05): the caller can talk over the agent; the client cuts
+  playback and sends {"type":"interrupt"} over the WS, the server cancels
+  the in-flight reply, and only delivered sentences enter memory. Mic
+  noise reduction (browser echoCancellation/noiseSuppression/autoGain
+  control) is requested in routers/ui.py to cut false barge-ins. A VAD-
+  stall watchdog forces end-of-speech if the transcript stops changing for
+  2.5s (rescues noisy rooms where Silero never fires end-of-speech).
+
+- Urdu STT: the live session is pinned to language "ur" (Deepgram nova-3).
+  Do NOT switch it to "multi" - multi lacks Urdu and produces Hindi/
+  Devanagari transcripts.
+
+- A text sanitizer strips stray foreign-script characters (rare LLM
+  glitches) from both the TTS audio input and the displayed text.
+
+- If a reply ever fails: Groq errors auto-fall back to OpenAI (logged as
+  groq_generate_failed_falling_back_to_openai in the service log).
+
+- vast.ai note: their containers cannot run Docker - use the Qdrant
+  binary method (section 3, step 2).
+
+- Old n8n stack (ChromaDB :8000, n8n :5678) is unrelated to this package.
+
+CURRENT LIVE DEPLOYMENT (as of 2026-07-05, for reference):
+  Server:      vast.ai instance, ssh -p 56250 root@70.30.158.46
+  Python env:  /venv/main  (NOTE: /venv is OUTSIDE /workspace, so vast RESETS
+               it to the base image on every instance restart — the agent
+               deps must be reinstalled after each reboot:
+                 /venv/main/bin/pip install -r \
+                   /workspace/voice_inference_service/requirements.txt
+               torch is already present in the base image; a pip-freeze
+               snapshot is auto-saved under /workspace/.venv-backups/.)
+  HF cache:    /workspace/.hf_home (HF_HOME set globally in /etc/environment,
+               so BGE-M3 is NOT re-downloaded across restarts). If startup
+               ever dies with "Stale file handle" on a bge-m3 blob, the
+               cache got corrupted: rm the models--BAAI--bge-m3* dirs under
+               /workspace/.hf_home/hub and let it re-download once.
+  Service:     /workspace/voice_inference_service, tmux session "vis",
+               log: /workspace/_vis.log
+  Qdrant:      /workspace/qdrant (binary), tmux session "qdrant", port 6333,
+               storage persists in /workspace/storage (collection already
+               restored: restaurant_knowledge_bgem3, 154 pts)
+  Data:        /workspace/restaurant_data
+  Tunnel:      cloudflared tunnel of :8800 for /ui (tmux session "cf8800",
+               log /workspace/_cf8800.log) — ephemeral, dies on restart and
+               gets a NEW url; grep it back:
+                 grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' \
+                   /workspace/_cf8800.log
+  GPU note:    the P4000 is compute capability sm_61 (Pascal); the base
+               image's torch (cu130) is built only for sm_75+, so it CANNOT
+               run CUDA kernels on this card -> keys.env pins VIS_DEVICE=cpu.
+               To actually use the GPU, install a Pascal-compatible torch
+               (a cu121/cu118 wheel that still includes sm_61) FIRST, then
+               set VIS_DEVICE=cuda.
+  Restart the service on that box:
+    tmux kill-session -t vis
+    tmux new-session -d -s vis "cd /workspace/voice_inference_service && \
+      set -a && . ./keys.env && set +a && \
+      exec /venv/main/bin/python app.py >> /workspace/_vis.log 2>&1"
+
+================================================================================
+ 11. RECENT CHANGES (2026-07-03 / 2026-07-04)
+================================================================================
+
+These landed after the 07-02 snapshot above. They are ALREADY in this folder
+(code is current); this section just documents what changed and why.
+
+RECEPTIONIST CALL FLOW (prompts.py)
+  - The agent now opens the call itself: it greets with the restaurant name
+    the instant the call starts (GREETING_TEXT, played by _send_call_greeting
+    in voice_stream.py before turn 1), then walks ONE step per turn:
+      greeting -> ask name -> phone -> address -> take order -> read the
+      order back -> confirm.
+  - REQUIRED CHOICES rule: when an item has options (size / flavor / variant)
+    the agent ASKS instead of assuming, and does not finalize the order until
+    every choice is resolved.
+  - Order read-back happens after confirmation; the confirmed-order marker is
+    "عملہ جلد تصدیق" (_ORDER_CONFIRMED_MARKER in voice_stream.py).
+  - Reply cap raised 2 -> 4 sentences (_MAX_REPLY_SENTENCES) so multi-item
+    read-backs are not truncated.
+
+START / END CALL UI (routers/ui.py — the /ui website)
+  - The test site now has explicit "📞 Start Call" and "📴 End Call"
+    buttons. A fresh conversation_id is generated per call (not per page
+    load). End Call POSTs /call/end to tear the call down server-side.
+  - The dashboard "Interrupt" button hits the same /call/end path so it
+    actually ends the live call (see dashboard integration below).
+
+NUMBERS — DETECTION (services/number_normalizer.py)
+  - Deepgram numerals=true was REMOVED from the STT URL (it broke nova-3
+    Urdu streaming: eos_to_final jumped to 4-8s with garbage partials). A
+    deterministic normalizer handles numbers instead and is more reliable.
+  - normalize_spoken_numbers() maps Urdu / Roman / English AND Urdu-script-
+    English spoken digits (زیرو ون ٹو تھری فور فائیو سکس سیون ایٹ نائن) to
+    ASCII, un-glues concatenated tokens (تھریونٹو -> 312), handles
+    double/triple, and glues 4+ digit runs into phone numbers while keeping
+    1-3 digit quantities spaced.
+
+NUMBERS — SPEECH (services/tts_service.py)
+  - _speak_digits_individually spaces out digit runs of 7+ (_LONG_DIGIT_RUN)
+    so phone numbers are read digit-by-digit by TTS; short numbers and
+    prices are left intact.
+
+ORDER EXTRACTION (services/order_extractor.py)
+  - The chosen size/variant/flavor is folded into the item name
+    (e.g. "Chicken Fajita Large", "Soft Drink Can Pepsi").
+
+LATENCY — SPECULATIVE EMBEDDING ON LONG SENTENCES
+  (services/speculative_embedder.py + startup.py + routers/voice_stream.py)
+  - Rewritten to CONTINUOUS CHAINED speculation: one self-chaining worker
+    always embeds the newest partial (at most one embed in flight), so by
+    end-of-speech the near-final embedding is usually already done — long
+    utterances now HIT (embed_ms ~0) instead of paying 400-1400ms on the
+    critical path.
+  - VERB-FINAL prefix tolerance: because Urdu is SOV, a speculated prefix
+    that differs from the final only by a short trailing verb/copula
+    (چاہیے، دے دیں، ہے …) is treated as a HIT; any content difference
+    (missing item, quantity, second dish) still MISSes and re-embeds.
+  - startup.py caps state.embedding_model.max_seq_length = 256 (BGE-M3
+    defaults to 8192) to bound the worst-case CPU embed.
+  - voice_stream.py relay_partial now feeds partials through the SAME
+    number normalization as the final (embedder.on_partial(_clean_transcript
+    (text))), so numbered orders can HIT (previously partials "دو بیف" vs
+    final "2 بیف" never matched -> all MISS).
+
+DASHBOARD INTEGRATION (separate repo — see "where the frontend is" note)
+  - Orders/calls from the voice agent are ingested into the dashboard DB;
+    live calls + transcripts (English + Urdu Nastaliq) show on the
+    dashboard. The dashboard's End/Interrupt drives /call/end on this
+    service. This service is unchanged by that except for the /call/end
+    endpoint it already exposes.
+
+================================================================================
+ 12. RECENT CHANGES (2026-07-05)
+================================================================================
+
+ALL of the below are ALREADY in this folder (code is current) and deployed
+on the live server. This section documents what changed and why.
+
+BARGE-IN / INTERRUPTION (routers/ui.py + routers/voice_stream.py)
+  - The caller can talk OVER the agent to interrupt it. The mic + Silero VAD
+    now stay armed even while the agent's reply audio is playing; captured
+    frames go into a ~2s rolling pre-buffer until it is really the caller's
+    turn, so the first words of an interruption are never lost.
+  - On detected speech during playback the client instantly stops the audio,
+    sends {"type":"interrupt"} on the WS, and flushes the pre-buffer into the
+    next turn. Server side, _watch_for_interrupt() races the reply pipeline;
+    on interrupt (or disconnect) it cancels LLM generation + TTS immediately
+    and stores ONLY the sentences actually delivered into conversation memory
+    (sent_parts), so the agent knows exactly how far it got. done{} now
+    carries an "interrupted" flag.
+  - ZERO added latency on normal turns: the watcher just awaits WS frames
+    that never arrive mid-reply, and the next turn's WS now opens right at
+    done{} (STT connects lazily on first audio) instead of polling for
+    playback to finish — inter-turn latency only improves.
+
+MIC NOISE REDUCTION (routers/ui.py)
+  - getUserMedia is requested with echoCancellation + noiseSuppression +
+    autoGainControl (browser-native, speech-tuned DSP). This cleans the mic
+    signal BEFORE VAD/STT and cancels the agent's own voice out of the mic
+    (fewer false barge-ins). It touches ONLY the mic path, not TTS playback,
+    so voice quality is unaffected. Falls back to default constraints if a
+    browser rejects them.
+
+VAD-STALL WATCHDOG (routers/ui.py)
+  - In a noisy room Silero can stay stuck in "speech" long after the caller
+    stops (observed: 30s turns whose end-of-speech->final was only ~300ms —
+    all the wait was the VAD never firing). The watchdog forces end-of-speech
+    if the Deepgram partial transcript has not changed for 2.5s. Quiet rooms
+    are unaffected (Silero's ~385ms redemption fires first) — no added
+    latency on healthy turns.
+
+ORDER-COMPLETE FLOW (prompts.py + voice_stream.py)
+  - Saying the order is complete (بس / مکمل / یہی آرڈر ہے) IS the
+    confirmation: the agent reads the order back and ends that SAME reply
+    with the fixed closing line — it no longer asks "کیا آپ کا آرڈر مکمل
+    ہے؟" again. Post-close corrections update the order and re-close.
+  - MULTI-DETAIL SINGLE LINE: if one utterance gives several details (name +
+    phone + address + items, and/or "complete"), the agent captures them all,
+    SKIPS the flow steps they answer, and jumps straight to the read-back +
+    close if nothing is missing.
+  - _MAX_REPLY_SENTENCES raised 4 -> 5 to fit the read-back + closing line.
+  - FIRST-TRY CLOSE (2026-07-06, prompts.py v6): a highest-priority
+    "CLOSING IS TERMINAL" rule makes "order complete" close on the first try
+    — at close the reply is read-back + the exact closing line only, with NO
+    question mark, no re-asking size/variant for already-priced items, and
+    retrieved delivery-minimum/charge/timing/promo context is ignored (those
+    were derailing the close). Verified 5/5 with derailer context in
+    tests/test_order_close.py.
+  - AUTO-END ON ORDER PLACED (2026-07-06): once the closing line is spoken,
+    the WS done{} message carries order_placed=true (marker in the answer).
+    The /ui then stops opening turns, lets the closing audio finish, and ends
+    the call automatically (stops mic/VAD, closes). The dashboard side was
+    already ended at that point by _report_turn's reporter.end(); the call
+    shows ENDED / ORDER_PLACED with the order attached.
+
+MIXED URDU/ENGLISH (prompts.py)
+  - New UNDERSTANDING section: input is code-switched Urdu/English STT output
+    that may contain small transcription errors; the agent matches English/
+    Roman/garbled item names to the closest menu item instead of stumbling.
+    Output stays PURE URDU (the TTS voice reads it aloud). Works for callers
+    speaking English, Urdu, or a mix.
+
+NUMBER GARBLES (services/number_normalizer.py)
+  - Extended to the messy forms Deepgram ur actually produces for spoken
+    numbers: truncated glued tokens (ڈبل->ڈب/ٹبل, زیرو->ز/زیر/زرو), digit
+    words split across two tokens (سے فر = صفر, with trailing digits mashed
+    on: سے فرچھے), "double" ending a glued token and doubling the NEXT token,
+    and sound-alike real words (سفر≈صفر) converted ONLY inside a numeric
+    context so normal sentences ("میں کل سفر پر جا رہا ہوں") are untouched.
+  - Verified with test_number_normalizer.py (unit) AND test_number_audio.py
+    (real speech -> Deepgram -> normalizer round-trip).
+
+ENGLISH DIGIT READ-BACK (services/tts_service.py)
+  - _speak_digits_individually now speaks 7+ digit runs as comma-paced
+    ENGLISH digit words ("zero, three, one, two, ...") so the caller hears an
+    unambiguous digit-by-digit phone number. Prices/quantities (<=6 digits)
+    stay numeric. Spoken form only — the dashboard transcript keeps the
+    compact number.
+
+WEB AUDIO PLAYBACK (routers/ui.py — 2026-07-06, latency)
+  - The /ui call page now plays the agent's reply with the Web Audio API
+    (AudioContext + decodeAudioData + AudioBufferSourceNode) instead of an
+    HTML <audio> element reloading a fresh blob per sentence. Each reply
+    sentence still arrives as its own MP3 blob over the WS; it is decoded to
+    PCM and scheduled back-to-back on the audio clock. Result: lower time to
+    first sound (no <audio> load/readyState/play()-promise cycle) and NO gaps
+    between sentences; barge-in is instant (source.stop()). The AudioContext
+    is unlocked on the Start-Call click (autoplay policy). The POST /voice and
+    stream-blob TEST modes still use the <audio> #player element (not the live
+    path). Client latency instrumentation logs, per turn, on the /ui page:
+    "eos → first audio bytes at browser" (server pipeline + tunnel network),
+    "browser decode+schedule (bytes → audible)", and "PERCEIVED eos → first
+    sound" — subtract the server timing table from the first to isolate the
+    tunnel network.
+
+RECEPTIONIST TAKEOVER / INTERRUPT (routers/voice_stream.py + ui.py +
+services/dashboard_reporter.py)
+  - The dashboard's "Interrupt" button marks the call TRANSFERRING. The /ui
+    page polls GET /call/state?conversation_id=... every 2s (which proxies
+    to the dashboard ingest GET /state via the SAME agent->dashboard URL+key
+    — no new config). When it sees transferred=true it DROPS the AI link
+    (closes the WS, stops mic/VAD), plays the caller an Urdu hold message
+    ("please hold, our staff will call you back"), and leaves the call
+    TRANSFERRING on the dashboard (does NOT /call/end it — the receptionist
+    ends it after calling back). If reporting is disabled/unreachable the
+    poll returns transferred=false and the AI just keeps running.
+
+STT LATENCY OPTIMIZATIONS — 2026-07-07: ATTEMPTED, THEN REVERTED
+  A three-part change was tried (persistent Deepgram connection across
+  turns via a per-conversation registry + KeepAlive; Finalize instead of
+  CloseStream; VAD redemptionFrames 4->3) to cut per-turn STT latency. In
+  live testing it made things WORSE, so it was fully rolled back the same
+  day — services/stt_service.py, routers/voice_stream.py, state.py and
+  routers/ui.py are restored to their pre-change versions (hashes
+  b1df7a74 / 238fcd2c / 3f5c6b2e / 3de86588). Do NOT re-apply without
+  live A/B evidence that it actually helps this deployment.
+
+SSH / DEPLOY GOTCHA (2026-07-07)
+  The claude-code key is NOT a default identity, so ssh/scp MUST pass it
+  explicitly or auth fails with "Permission denied (publickey)" even though
+  the key IS in the server's authorized_keys:
+    ssh -i /c/Users/Lenovo/.ssh/vastai_key -p <PORT> -o IdentitiesOnly=yes root@<IP>
+    scp -i /c/Users/Lenovo/.ssh/vastai_key -P <PORT> -o IdentitiesOnly=yes <f> root@<IP>:<dst>
+  Note scp uses -P (capital) for port; a lowercase -p is silently read as
+  "preserve times" and the port arg becomes a bogus source file. The key
+  still gets dropped from ~/.ssh/authorized_keys on every instance restart
+  and must be re-appended via the vast web console.
+
+================================================================================
+ END OF GUIDE
+================================================================================
